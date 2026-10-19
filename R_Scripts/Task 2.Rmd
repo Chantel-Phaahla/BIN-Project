@@ -1,0 +1,225 @@
+---
+title: "Task 2"
+output:
+  word_document: default
+  html_document: default
+  pdf_document: default
+date: "2026-10-03"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r cars}
+#install.packages("tidyverse")
+#install.packages("yardstick")
+```
+
+```{r}
+library(tidyverse)
+library(yardstick)
+metrics_set <- yardstick::metric_set(
+  yardstick::accuracy, 
+  yardstick::precision, 
+  yardstick::recall, 
+  yardstick::f_meas, 
+  yardstick::spec
+)
+```
+
+
+```{r}
+preds <- read.csv("data/test_predictions.csv")
+```
+
+```{r}
+preds <- preds %>% 
+  mutate(FoodInsecure_flag = factor(FoodInsecure_flag, levels = c("Insecure","Secure")),pred_class = factor(.pred_class , levels = c("Insecure","Secure")))
+
+rf_preds <- preds %>% filter(model=="Random forest")
+lr_preds <- preds %>% filter(model=="Logistic regression")
+
+nrow(rf_preds) ; nrow(lr_preds)
+```
+```{r}
+#Producing a confusion matrix for each model 
+conf_rf <- conf_mat(rf_preds , truth = FoodInsecure_flag , estimate = pred_class)
+conf_rf
+
+
+```
+```{r}
+lr_pred <- lr_preds %>% 
+  mutate(.pred_class = factor(.pred_class , levels = c("Insecure" , "Secure")))
+conf_lr <- conf_mat(lr_pred , truth=FoodInsecure_flag , estimate = .pred_class)
+conf_lr
+```
+```{r}
+metrics_set <- yardstick::metric_set(
+  yardstick::accuracy, 
+  yardstick::precision, 
+  yardstick::recall, 
+  yardstick::f_meas, 
+  yardstick::spec
+)
+
+# Fix BOTH dataframes first, before any metrics are computed
+rf_preds <- rf_preds %>%
+  mutate(.pred_class = factor(.pred_class, levels = c("Insecure", "Secure")))
+```
+
+
+```{r}
+lr_preds <- lr_preds %>%
+  mutate(.pred_class = factor(.pred_class, levels = c("Insecure", "Secure")))
+```
+
+
+```{r}
+# NOW compute metrics using the fixed data
+rf_metrics <- rf_preds %>% metrics_set(truth = FoodInsecure_flag, estimate = .pred_class)
+lr_metrics <- lr_preds %>% metrics_set(truth = FoodInsecure_flag, estimate = .pred_class)
+```
+
+
+```{r}
+rf_auc <- rf_preds %>% yardstick::roc_auc(truth = FoodInsecure_flag, .pred_Insecure)
+lr_auc <- lr_preds %>% yardstick::roc_auc(truth = FoodInsecure_flag, .pred_Insecure)
+```
+
+
+```{r}
+rf_metrics; rf_auc
+```
+
+
+```{r}
+lr_metrics; lr_auc
+```
+
+```{r}
+library(ggplot2)
+```
+
+
+```{r }
+roc_data <- preds %>% 
+  group_by(model) %>% 
+  roc_curve(truth = FoodInsecure_flag , .pred_Insecure)
+
+ggplot(roc_data , aes(x= 1-specificity , y= sensitivity , color = model))+
+  geom_path(linewidth = 1) +
+  geom_abline(lty = 3 ) +
+  labs(title = "Roc Curve : Random Forest vs Logistic Regression") + 
+  theme_minimal()
+
+```
+```{r}
+rf_summary <- rf_metrics %>% 
+  select(.metric , .estimate) %>% 
+  mutate(model = "Random Forest")
+
+lr_summary <- lr_metrics %>% 
+  select(.metric , .estimate) %>%
+  mutate(model = "Logistic Regression")
+
+rf_auc_row <- tibble(.metric = "roc_auc", .estimate = rf_auc$.estimate , model = "Random Forest")
+
+lr_auc_row <- tibble(.metric = "roc_auc", .estimate = lr_auc$.estimate , model = "Logistic Regression")
+
+# Stacking everything together 
+validation_matrix <- bind_rows(rf_summary , lr_summary , rf_auc_row , lr_auc_row) %>%
+ pivot_wider(names_from = model , values_from = .estimate)
+
+validation_matrix
+
+```
+```{r}
+# Based on the validation matrix , Random Forest is selected as the final model. It outperforms Logistic Regression on ROC-AUC (0.840 vs 0.819), accuracy (0.840 vs 0.828) , precision (0.680 vs 0.569) and specificity (0.974 vs 0.953) meaning it ranks households mode reliably overall and produces far fewer alarms when it does flag a householf as food-insecure (68% of its positive flags are correct , vs 57% for Logistic Regression)
+
+#Logistic Regression has slightly better recall and F1-score, but the difference is small. Random Forest performs better overall on most metrics, so it is the stronger model.
+
+#However neither of the model performs well on recall at the default 0.5 cutoff both catch fewer than 3 in 10 actua; food insecure holdholds. This is the key limitation investigated in the next step.
+```
+
+```{r}
+
+```
+
+```{r}
+rf_preds <- rf_preds %>%
+  mutate(.pred_class_adj = if_else(.pred_Insecure > 0.3, "Insecure", "Secure")) %>%
+  mutate(.pred_class_adj = factor(.pred_class_adj, levels = c("Insecure", "Secure")))
+
+conf_mat(rf_preds , truth = FoodInsecure_flag , estimate = .pred_class_adj)
+```
+
+
+```{r}
+yardstick::recall(rf_preds , truth = FoodInsecure_flag , estimate = .pred_class_adj)
+```
+
+
+```{r}
+yardstick::precision(rf_preds , truth = FoodInsecure_flag , estimate = .pred_class_adj)
+```
+```{r}
+#Lowering the classification threshold from 0.5 to 0.3 substantially improves recall , from 24.6% to 63.3% , the model now correctly identifies 481 to 760 food-insecure households , versus 187 at the default threshold. This comes at a real cost to precision , which drops from 68.0% to 48.8%: nearly half of households flagged as food-insecure at this threshold are false alarms 
+
+# A 0.3 threshold catches more valuerabe households but also creates more false positives . it is better if missing a valuerable household is worse than incorrectly flagging one.
+```
+
+```{r}
+# TASK 3 
+rf_preds %>% 
+  group_by(ProvinceCode) %>% 
+  yardstick::recall(truth = FoodInsecure_flag, estimate = .pred_class)
+```
+```{r}
+rf_preds %>% 
+  filter(FoodInsecure_flag == "Insecure") %>% 
+  count(ProvinceCode)
+```
+```{r}
+# The recall rate is quite varied among the provinces , ranging from 5.0% in Province 9 to 35.1 in Province 5 almost seven times diffirence. Recall is not a matter of sample size alone because there are 20 genuine food insecure households in Province 9 test set of which only 1 has been recalled by the model. Similar is the case with province 7 where there is a low recall rate(13.0%) and a larger sample size(146 households).
+
+# This creates a problem of fairnessm since a tool that is used for the purpose of prioritizing intervention efforts would, based on current configuration of the model , serve the food insecure households in Provinces 9 and 7 much less than those in Province 5 . Without additional exploration(wether is because of a smaller number of training cases in these two provinces , or due to diffireny predictor-food insecurity relationships , or some other reason) , this problem needs to be acknowleged 
+```
+
+```{r}
+# By the technical sucess criteria set in Milestone 1 , the model performs well : ROC-AUC (0.840) comfortably exceeds the 0.75 threshold , more than the required 3 significant variables were identified , and both modelling approaches converge on the same key drivers (income , dwelling quality , province)
+
+# However being able to meet the ROC-AUC threshold does not mean the model is ready to support the started business decision , Milestone 1's business objective is to help identify valuerable households for target intervention and at the model's default classification threshold intervention and at the model's default classification threshold , only 24.6% of genuinely food-insecure households are actually flagged. A high ROC-AUC reflects good ranking abilitu across all possible thresholds , but the specific threshold needed for practical deployment (catching enough at risk- households to inform real resource allocation ) was not part of the original technical success criteria , and is arguably a gap is in how sucess was originally defined.
+
+#A threshold increase to 0.3 brings the recall up to 63.3% better matching the business goal, but it does come with the tradeoff of precision (48.8%), in that almost half of the identified cases would not actually experince food insecurity. This tradeoff and optimal threshold for the business goal need to be an intentional decision.
+```
+
+```{r}
+# Association vs Causation
+# The variable identified as important such as  income, dewelling quality , province , perceived income are associations that have been observed through the model analysis not as causative factors . For instance , individuals with low income face a high chance of being foof insecure ; however the findings does nit prove that increasing the income level alone can reduce food insecurity , as other factors not considered in the analysis (for instance , unexpected illness, food costs , job instability) may affect both the independent variable and the dependent variables. R6 risk from Milestone 1 predicted this same risj and concluded that findings should be considered associations and not causation. 
+```
+
+```{r}
+rf_preds %>%
+  group_by(HeadPopulationGroupCode) %>%
+  yardstick::recall(truth = FoodInsecure_flag, estimate = .pred_class)
+```
+
+
+```{r}
+rf_preds %>%
+  group_by(HeadSexCode) %>%
+  yardstick::recall(truth = FoodInsecure_flag, estimate = .pred_class)
+```
+```{r}
+rf_preds %>%
+  filter(FoodInsecure_flag == "Insecure") %>%
+  count(HeadPopulationGroupCode)
+```
+```{r}
+
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.

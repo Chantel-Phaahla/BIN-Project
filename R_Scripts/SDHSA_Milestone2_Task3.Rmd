@@ -1,0 +1,347 @@
+---
+title: "SDHSA Milestone 2 — Task 3 (Person 2)"
+subtitle: "Integrate and Construct — Join, Aggregate, Engineer Features, Data Dictionary"
+author: "Person 2"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(knitr)
+```
+
+# Task 3 — Integrate and Construct
+
+## 3.0 Inputs
+
+This document builds directly on Person 1's Task 1/2 outputs and does not
+re-clean any data. Reading in the cleaned exports and audit/flag files:
+
+```{r import}
+d01 <- read_csv("D01_cleaned.csv", show_col_types = FALSE,
+                col_types = cols(HouseholdID = col_character(), .default = col_guess()))
+d04 <- read_csv("D04_cleaned.csv", show_col_types = FALSE,
+                col_types = cols(HouseholdID = col_character(), .default = col_guess()))
+d05 <- read_csv("D05_cleaned.csv", show_col_types = FALSE,
+                col_types = cols(HouseholdID = col_character(), .default = col_guess()))
+d07 <- read_csv("D07_cleaned.csv", show_col_types = FALSE,
+                col_types = cols(HouseholdID = col_character(), .default = col_guess()))
+d09 <- read_csv("D09_cleaned.csv", show_col_types = FALSE,
+                col_types = cols(HouseholdID = col_character(), .default = col_guess()))
+
+hh_size_flags <- read_csv("flag_householdsize_mismatches.csv", show_col_types = FALSE)
+income_flags  <- read_csv("flag_income_mismatches.csv", show_col_types = FALSE)
+
+cat("Rows on import — D01:", nrow(d01), "| D04:", nrow(d04), "| D05:", nrow(d05),
+    "| D07:", nrow(d07), "| D09:", nrow(d09), "\n")
+cat("Flagged HouseholdSize mismatches:", nrow(hh_size_flags),
+    "| Flagged income mismatches:", nrow(income_flags), "\n")
+```
+
+## 3.1 Target grain and integration strategy
+
+The analytical grain is one row per `HouseholdID`. D04, D05, D07 and D09 are
+already at this grain (confirmed in Person 1's §2.7 summary). D01 is
+person-level and cannot legitimately be row-joined — joining a person-level
+table onto a household-level table on `HouseholdID` alone would silently
+fan out the household rows (a one-to-many join), which is not a valid
+integration at this grain. The justified alternative is **aggregation**:
+D01 is collapsed to one summary row per household first, and only the
+aggregated table is joined.
+
+## 3.2 Aggregate D01 to household grain
+
+```{r d01-aggregate}
+before_person_rows <- nrow(d01)
+before_households  <- n_distinct(d01$HouseholdID)
+
+d01_agg <- d01 %>%
+  group_by(HouseholdID) %>%
+  summarise(
+    HouseholdSize_D01   = n(),
+    Age_mean            = mean(Age_clean, na.rm = TRUE),
+    Age_median          = median(Age_clean, na.rm = TRUE),
+    N_Dependants        = sum(Age_clean < 15 | Age_clean > 64, na.rm = TRUE),
+    Dependency_ratio    = N_Dependants / pmax(HouseholdSize_D01 - N_Dependants, 1),
+    N_PopulationGroups  = n_distinct(PopulationGroupCode, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+cat("D01 person-level rows before aggregation:", before_person_rows, "\n")
+cat("Distinct HouseholdIDs in D01:", before_households, "\n")
+cat("Rows after aggregation (should equal distinct HouseholdIDs above):",
+    nrow(d01_agg), "\n")
+stopifnot(nrow(d01_agg) == before_households)
+```
+
+**Verification:** row count after aggregation equals the number of distinct
+households in the person-level file, confirming the aggregation is 1:1 at
+household grain and safe to join.
+
+## 3.3 Confirm join cardinality before joining
+
+Every household-level file should be 1:1 on `HouseholdID`. This is checked
+explicitly before any join is attempted, rather than assumed:
+
+```{r cardinality-check}
+check_1to1 <- function(df, name) {
+  n_rows <- nrow(df)
+  n_ids  <- n_distinct(df$HouseholdID)
+  cat(name, "— rows:", n_rows, "| distinct HouseholdID:", n_ids,
+      "| 1:1?", n_rows == n_ids, "\n")
+}
+check_1to1(d01_agg, "D01 (aggregated)")
+check_1to1(d04, "D04")
+check_1to1(d05, "D05")
+check_1to1(d07, "D07")
+check_1to1(d09, "D09")
+```
+
+`d05` is expected/confirmed here to be a subset of the household population
+covered by D04/D07/D09 — this is checked explicitly below via anti-join
+rather than assumed, since an unnoticed coverage gap would silently
+introduce `NA`s after the join.
+
+## 3.4 Sequential joins with row-count verification
+
+Joins are performed one at a time — not chained in a single pipe — so row
+counts can be checked after each step. D04 is used as the base table since
+it is confirmed 1:1 and dwelling-level.
+
+D07 and D09 each carry their own copies of `HouseholdSize`,
+`HouseholdSize_clean`, `Income_clean` and `TotalMonthlyHouseholdIncomeRaw`.
+Person 1's Task 2 flagged mismatches between these copies
+(`flag_householdsize_mismatches.csv`, `flag_income_mismatches.csv`) with no
+codebook basis to prefer one over the other row-by-row. Rather than let
+`dplyr`'s automatic `_D07`/`_D09` suffixing decide silently based on join
+order, every colliding column is renamed explicitly before joining, so it's
+unambiguous afterwards which file each figure came from.
+
+```{r join-step1}
+n_before <- nrow(d04)
+household_data <- d04 %>%
+  left_join(d01_agg, by = "HouseholdID")
+n_after <- nrow(household_data)
+cat("Join 1 (D04 + D01_agg): before =", n_before, "| after =", n_after,
+    "| row count preserved?", n_before == n_after, "\n")
+```
+
+```{r join-step2}
+n_before <- nrow(household_data)
+household_data <- household_data %>%
+  left_join(d05, by = "HouseholdID", suffix = c("", "_D05"))
+n_after <- nrow(household_data)
+cat("Join 2 (+ D05): before =", n_before, "| after =", n_after,
+    "| row count preserved?", n_before == n_after, "\n")
+
+# Coverage check: how many D04 households have no matching D05 record?
+d05_unmatched <- anti_join(d04, d05, by = "HouseholdID")
+cat("Households in D04 with no D05 match:", nrow(d05_unmatched), "\n")
+```
+
+```{r join-step3}
+n_before <- nrow(household_data)
+household_data <- household_data %>%
+  left_join(
+    d07 %>% rename(HouseholdSize_D07 = HouseholdSize,
+                    HouseholdSize_clean_D07 = HouseholdSize_clean,
+                    Income_clean_D07 = Income_clean,
+                    IncomeRaw_D07 = TotalMonthlyHouseholdIncomeRaw),
+    by = "HouseholdID", suffix = c("", "_D07")
+  )
+n_after <- nrow(household_data)
+cat("Join 3 (+ D07): before =", n_before, "| after =", n_after,
+    "| row count preserved?", n_before == n_after, "\n")
+```
+
+```{r join-step4}
+n_before <- nrow(household_data)
+household_data <- household_data %>%
+  left_join(
+    d09 %>% rename(HouseholdSize_D09 = HouseholdSize,
+                    Income_clean_D09 = Income_clean,
+                    IncomeRaw_D09 = TotalMonthlyHouseholdIncomeRaw),
+    by = "HouseholdID", suffix = c("", "_D09")
+  )
+n_after <- nrow(household_data)
+cat("Join 4 (+ D09): before =", n_before, "| after =", n_after,
+    "| row count preserved?", n_before == n_after, "\n")
+```
+
+**Final integrated table:**
+
+```{r join-summary}
+cat("Final household_data — rows:", nrow(household_data),
+    "| distinct HouseholdID:", n_distinct(household_data$HouseholdID), "\n")
+stopifnot(nrow(household_data) == n_distinct(household_data$HouseholdID))
+```
+
+Row count held constant at every step and matches the distinct-household
+count throughout, confirming every join was 1:1 (no fan-out) and no
+household was duplicated or unintentionally dropped.
+
+## 3.5 Column-level selection: dropping redundant raw income copies
+
+`IncomeRaw_D07` and `IncomeRaw_D09` are the pre-sentinel-cleaned income
+figures — the same field `Income_clean_D07`/`Income_clean_D09` were derived
+from in Task 2. Keeping both the raw and cleaned versions would mean
+carrying two redundant, sentinel-contaminated columns into the final
+dataset for no analytical benefit (mirroring Person 1's §1.4 column-level
+selection approach: drop columns with no analytical content once a cleaned
+equivalent exists).
+
+```{r drop-raw-income}
+n_cols_before <- ncol(household_data)
+household_data <- household_data %>%
+  select(-IncomeRaw_D07, -IncomeRaw_D09)
+cat("Columns before:", n_cols_before, "| after dropping raw income duplicates:",
+    ncol(household_data), "\n")
+```
+
+## 3.6 Derived / engineered features
+
+Each engineered variable below states its source columns, construction, and
+the analytical rationale for including it.
+
+```{r derived-features}
+household_data <- household_data %>%
+  mutate(
+    # Services-access index (water + sanitation).
+    # Electricity access is not captured in D04 or D05 in this data pack
+    # (confirmed against both files' column lists), so it is excluded here
+    # rather than substituted with a proxy (e.g. D09's appliance-ownership
+    # codes, which measure something different) — a documented limitation
+    # rather than a fabricated component.
+    Services_access_index = rowSums(cbind(
+      PipedWaterCode_clean == 1,    # confirmed via table(d05$PipedWaterCode_clean)
+      MainToiletCode %in% c(1, 2)   # confirmed via table(d05$MainToiletCode)
+    ), na.rm = TRUE),
+
+    # Income per capita: D07's cleaned income divided by D01-derived
+    # household size. D07 is used rather than D09 since Person 1's Task 2
+    # flagged the two as mismatched for some households with no codebook
+    # basis to prefer one over the other; D07 is chosen here for
+    # consistency with the food-security variables this feature is meant
+    # to relate to.
+    Income_per_capita = Income_clean_D07 / pmax(HouseholdSize_D01, 1),
+
+    # Food insecurity flag: convenience binary from D07's recoded label.
+    # A clean 0/1 flag is easier to use in modelling/segmentation than the
+    # three-level factor, while the factor itself is retained.
+    FoodInsecure_flag = if_else(RanOutOfFood_label == "Yes", 1L, 0L)
+  )
+
+summary(household_data$Services_access_index)
+summary(household_data$Income_per_capita)
+table(household_data$FoodInsecure_flag, useNA = "ifany")
+```
+
+## 3.7 Final data dictionary
+
+Retained and engineered variables are tiered qualitatively following
+Person 1's §1.3 scheme (High = directly measures resources/access
+hypothesised to drive the outcome; Medium = demographic/context variable
+that conditions the outcome; Low = administrative/design field, not a
+substantive predictor).
+
+```{r data-dictionary}
+data_dictionary <- tibble::tribble(
+  ~Variable,                              ~Source,             ~Type,       ~Tier,     ~Description,
+
+  # --- Key ---
+  "HouseholdID",                          "D04/D05/D07/D09",   "character", "Key",     "Household key, join grain",
+
+  # --- D01 (aggregated to household grain) ---
+  "HouseholdSize_D01",                    "D01 (aggregated)",  "integer",   "Medium",  "Count of persons per household from D01",
+  "Age_mean",                             "D01 (aggregated)",  "double",    "Medium",  "Mean cleaned age of household members",
+  "Age_median",                           "D01 (aggregated)",  "double",    "Medium",  "Median cleaned age of household members",
+  "N_Dependants",                         "D01 (aggregated)",  "integer",   "Medium",  "Members aged <15 or >64",
+  "Dependency_ratio",                     "D01 (engineered)",  "double",    "Medium",  "N_Dependants / working-age members",
+  "N_PopulationGroups",                   "D01 (aggregated)",  "integer",   "Medium",  "Distinct PopulationGroupCode values within household",
+
+  # --- D04 ---
+  "HeadPopulationGroupCode",              "D04",               "integer",   "Medium",  "Population group of household head",
+  "HeadSexCode",                          "D04",               "integer",   "Medium",  "Sex of household head",
+  "HeadAge",                              "D04",               "integer",   "Medium",  "Age of household head",
+  "MainDwellingCode",                     "D04",               "integer",   "Medium",  "Main dwelling type",
+  "WallMaterialCode_clean",               "D04",               "integer",   "Medium",  "Cleaned wall material code",
+  "RoofMaterialCode",                     "D04",               "integer",   "Medium",  "Roof material code",
+  "FloorMaterialCode",                    "D04",               "integer",   "Medium",  "Floor material code",
+  "WallConditionCode",                    "D04",               "integer",   "Medium",  "Wall condition code",
+  "RoofConditionCode",                    "D04",               "integer",   "Medium",  "Roof condition code",
+  "FloorConditionCode",                   "D04",               "integer",   "Medium",  "Floor condition code",
+  "TotalRooms_clean",                     "D04",               "integer",   "Medium",  "Cleaned total rooms in dwelling",
+  "TenureCode",                           "D04",               "integer",   "Medium",  "Tenure status code",
+  "RentRaw_clean",                        "D04",               "double",    "Medium",  "Cleaned monthly rent",
+  "RDPHousingCode",                       "D04",               "integer",   "Medium",  "RDP housing flag",
+  "HousingSubsidyCode",                   "D04",               "integer",   "Medium",  "Housing subsidy flag",
+  "HouseholdSize_clean",                  "D04",               "integer",   "Medium",  "D04's cleaned household size (treated as base-table copy)",
+  "MetroCode",                            "D04",               "integer",   "Low",     "Metro/non-metro geography code",
+  "ProvinceClean",                        "D04",               "character", "Low",     "Canonical province label (base-table copy, from Task 2 §2.0)",
+
+  # --- D05 ---
+  "PipedWaterCode_clean",                 "D05",               "integer",   "High",    "Cleaned piped-water access code",
+  "WaterSafeCode",                        "D05",               "integer",   "High",    "Perceived water safety code",
+  "WaterTreatmentCode",                   "D05",               "integer",   "Medium",  "Water treatment method code",
+  "MainToiletCode",                       "D05",               "integer",   "High",    "Main toilet type code",
+  "SharedToiletCode",                     "D05",               "integer",   "Medium",  "Shared-toilet flag",
+  "ToiletDistanceCode_clean",             "D05",               "integer",   "Medium",  "Cleaned distance-to-toilet code",
+  "HandwashingFacilityCode",              "D05",               "integer",   "Medium",  "Handwashing facility availability code",
+  "WaterInterruptionFrequencyCode_clean", "D05",               "integer",   "Medium",  "Cleaned water-interruption frequency code",
+
+  # --- D07 ---
+  "AdultHungerCode",                      "D07",               "integer",   "High",    "Adult hunger indicator code",
+  "ChildHungerCode",                      "D07",               "integer",   "High",    "Child hunger indicator code",
+  "WorriedFoodWouldRunOutCode",           "D07",               "integer",   "High",    "Food-insecurity worry indicator code",
+  "UnableToEatHealthyFoodCode",           "D07",               "integer",   "High",    "Diet-quality food-insecurity code",
+  "FewFoodsDays_clean",                   "D07",               "integer",   "High",    "Cleaned days eating few food types",
+  "SkippedMealDays_clean",                "D07",               "integer",   "High",    "Cleaned days meals were skipped",
+  "AteLessDays_clean",                    "D07",               "integer",   "High",    "Cleaned days ate less than needed",
+  "RanOutDays_clean",                     "D07",               "integer",   "High",    "Cleaned days food ran out",
+  "RanOutOfFoodCode",                     "D07",               "integer",   "High",    "Raw ran-out-of-food code, Stats-SA convention 1/2/9",
+  "RanOutOfFood_label",                   "D07",               "character", "High",    "Recoded label (Yes/No/Don't know-refused); provisional pending GHS codebook",
+  "HouseholdSize_D07",                    "D07",               "integer",   "Low",     "D07's own HouseholdSize copy, kept for transparency (see §3.4 note)",
+  "HouseholdSize_clean_D07",              "D07",               "integer",   "Low",     "D07's own cleaned HouseholdSize copy, kept for transparency",
+
+  # --- D09 ---
+  "MainIncomeSourceCode_clean",           "D09",               "integer",   "High",    "Cleaned main income source code",
+  "SocialGrantRecipients",                "D09",               "integer",   "High",    "Number of social grant recipients in household",
+  "TotalGrantRecipients",                 "D09",               "integer",   "High",    "Total grant recipients in household",
+  "SalaryEarnersInHousehold",             "D09",               "integer",   "High",    "Number of salary earners in household",
+  "VehicleAssetCode",                     "D09",               "integer",   "Medium",  "Vehicle ownership indicator code",
+  "TotalVehicles_clean",                  "D09",               "integer",   "Medium",  "Cleaned total vehicle count",
+  "FridgeAssetCode",                      "D09",               "integer",   "Medium",  "Fridge ownership indicator code",
+  "FreezerAssetCode",                     "D09",               "integer",   "Medium",  "Freezer ownership indicator code",
+  "HouseholdSize_D09",                    "D09",               "integer",   "Low",     "D09's own HouseholdSize copy, kept for transparency",
+  "Income_clean_D07",                     "D07",               "double",    "High",    "D07's cleaned income; used as the authoritative income figure (see §3.4)",
+  "Income_clean_D09",                     "D09",               "double",    "Low",     "D09's cleaned income, kept for transparency but not used in Income_per_capita",
+
+  # --- Engineered (§3.6) ---
+  "Services_access_index",                "D05 (engineered)",  "integer",   "High",    "Count of adequate water+sanitation indicators (0-2); electricity excluded, not captured in this data pack",
+  "Income_per_capita",                    "D07 (engineered)",  "double",    "High",    "Income_clean_D07 / HouseholdSize_D01",
+  "FoodInsecure_flag",                    "D07 (engineered)",  "integer",   "High",    "1 = RanOutOfFood_label == 'Yes', else 0"
+)
+kable(data_dictionary, caption = "Data dictionary — retained and engineered variables")
+```
+
+*(Note: the D04/D05/D07/D09 rows above document the columns retained after
+Task 2's cleaning and Task 3's joins; if any additional low-relevance
+administrative columns — e.g. `SurveyYear`, `GeoTypeCode`,
+`HouseholdWeight` — are also being retained downstream for correct
+survey-weighted estimation per Person 1's §1.3 note, add them here as
+"Low" tier rather than omitting them silently.)*
+
+## 3.8 Export
+
+```{r export, include=FALSE}
+write_csv(household_data, "household_data_integrated.csv")
+write_csv(data_dictionary, "data_dictionary.csv")
+```

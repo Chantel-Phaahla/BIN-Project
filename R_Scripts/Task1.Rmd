@@ -1,0 +1,300 @@
+---
+title: "Task1"
+output: word_document
+date: "2026-09-29"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Analytical question and modelling task
+
+Can household demographic, housing, basic-service access and resource characteristics be used to predict whether a South African household is food insecure?
+My Target is FoodInsecure_flag
+**Modelling task: supervised binary classification**
+This is a supervised binary classification problem because the response variable, FoodInsecure_flag, contains two classes: 0 (not food insecure) and 1 (food insecure).
+**two defensible candidate modelling approaches**
+Logistic Regression and Random Forest
+
+**Why is Logistic Regression suitable?**
+ogistic regression is appropriate because the response variable is binary. The model estimates the probability that a household belongs to the food-insecure class based on household demographic, housing, service-access and resource characteristics. It also provides interpretable coefficients, making it useful for understanding the direction and strength of associations between predictors and food insecurity.
+
+**What assumptions does Logistic Regression make?**
+it is assumed that there is no severe multicollinearity among the predictor variables and that continuous predictors have an appropriate relationship with the log-odds of food insecurity
+
+**What assumptions does Random Forest make?**
+has fewer statistical assumptions and does not require a linear relationship between predictors and the outcome. For both models, it is assumed that the variables have been correctly cleaned and coded, missing values are appropriately handled, and no information from the validation or test data is used when fitting preprocessing steps or training the models.
+
+
+## Parameter Choices and Suitability of the Techniques
+
+**Logistic Regression:** Logistic regression was selected because the business objective is to predict whether a household is food insecure, making this a binary classification problem. The model uses FoodInsecure_flag as the response variable, with household demographic, housing, service and resource characteristics as predictors. The binomial family is used because the outcome has two classes (0 = not food insecure and 1 = food insecure). Logistic regression is also useful because its results are relatively easy to interpret, allowing the relationships between household characteristics and the likelihood of food insecurity to be examined.
+
+**Random Forest**: Random Forest was selected as a second modelling approach because it can identify nonlinear relationships and interactions between household characteristics without requiring a linear relationship between the predictors and the outcome. The main parameters considered are the number of trees (ntree), the number of predictors considered at each split (mtry), and the minimum number of observations required for a node to be split (min_n). A sufficiently large number of trees will be used to provide stable predictions, while mtry and min_n can be tuned using cross-validation on the training data. Comparing Random Forest with logistic regression provides two different modelling approaches: an interpretable statistical model and a more flexible tree-based model. This is appropriate for the business objective because the analysis aims both to predict households at risk of food insecurity and to understand which household characteristics are useful for identifying this risk.
+## Step 0 – Libraries
+
+```{r libraries}
+library(tidyverse)
+library(tidymodels)
+library(ranger)
+tidymodels_prefer()
+```
+
+## Step 1 – Load data
+
+`guess_max = Inf` makes readr look at every row when guessing types, so columns such as
+`TotalVehicles` (which contain "Unknown" / "not recorded") are not mis-typed.
+
+```{r load}
+train_data <- read_csv("data/train_data.csv", guess_max = Inf)
+test_data  <- read_csv("data/test_data.csv",  guess_max = Inf)
+
+dim(train_data)
+dim(test_data)
+prop.table(table(train_data$FoodInsecure_flag))
+prop.table(table(test_data$FoodInsecure_flag))
+```
+
+## Step 2 – Stateless cleaning (same  rules on train and test)
+
+* Special codes (9 / 99 = "unknown") in ordinal columns become `NA`.
+* Nominal survey codes become factors (their numeric size is meaningless).
+* The target becomes a factor with the **positive class first** (yardstick treats the first level as the event).
+
+```{r cleaning}
+nominal_codes <- c(
+  "ProvinceCode", "HeadPopulationGroupCode", "HeadSexCode", "MainDwellingCode",
+  "WallMaterialCode_clean", "RoofMaterialCode", "FloorMaterialCode",
+  "TenureCode", "RDPHousingCode", "HousingSubsidyCode", "GeoTypeCode",
+  "DrinkingWaterSourceCode", "MainToiletCode", "SharedToiletCode",
+  "ToiletLocationCode", "WaterAlternativeSourceCode_clean",
+  "MainIncomeSourceCode_clean"
+)
+
+unknown9_cols <- c("RoofConditionCode", "WallConditionCode", "FloorConditionCode",
+                   "ComparativeIncomeCode", "NoIncomeCode",
+                   "VehicleAssetCode", "TVAssetCode", "PayTVAssetCode",
+                   "ComputerAssetCode", "WashingMachineAssetCode", "FreezerAssetCode",
+                   "FridgeAssetCode", "MicrowaveAssetCode", "GeyserAssetCode",
+                   "SolarPanelAssetCode", "RadioAssetCode")
+
+clean_data <- function(df) {
+  df %>%
+    mutate(
+      across(any_of(unknown9_cols), ~ na_if(.x, 9)),
+      ExpenditureBandCode = na_if(ExpenditureBandCode, 99),
+      across(any_of(nominal_codes), as.factor),
+      FoodInsecure_flag = factor(FoodInsecure_flag,
+                                 levels = c(1, 0),
+                                 labels = c("Insecure", "Secure"))
+    )
+}
+
+train_data <- clean_data(train_data)
+test_data  <- clean_data(test_data)
+
+table(train_data$FoodInsecure_flag)
+table(test_data$FoodInsecure_flag)
+```
+
+## Step 3 – Preprocessing recipe
+
+Every learned step (imputation, rare-level pooling, dummy coding, correlation filter,
+normalisation) is estimated on the analysis part of each CV fold only, because the recipe
+sits inside the workflow.
+
+```{r recipe}
+drop_cols <- c(
+  # duplicate / redundant geography and weights
+  "Province_source", "Province_source_D05", "Province_source_D07", "Province_source_D09",
+  "ProvinceClean_D07", "ProvinceClean_D09", "ProvinceCode_D05", "ProvinceCode_D07",
+  "ProvinceCode_D09", "GeoTypeCode_D05", "GeoTypeCode_D07",
+  "HouseholdWeight", "HouseholdWeight_D05", "HouseholdWeight_D07", "HouseholdWeight_D09",
+  "HouseholdSize", "HouseholdSize_D01",
+  # raw versions that already have a *_clean column
+  "RentRaw", "WallMaterialCode", "TotalRooms", "MainIncomeSourceCode",
+  "DistanceToWaterCode", "PipedWaterCode", "PipedWaterCode_clean",
+  "WaterInterruptionFrequencyCode", "WaterAlternativeSourceCode", "ToiletDistanceCode",
+  # raw text / outlier columns; TotalVehicles_clean already exists
+  "TotalVehicles", "TimeToWaterRaw", "RequiredIncomeRaw",
+  # constant columns
+  "SurveyYear", "SurveyYear_D05", "SurveyYear_D07", "SurveyYear_D09"
+)
+
+model_recipe <- recipe(FoodInsecure_flag ~ ., data = train_data) %>%
+  step_rm(any_of(drop_cols)) %>%
+  step_indicate_na(RentRaw_clean) %>%                 
+  step_impute_median(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_novel(all_nominal_predictors()) %>%
+  step_other(all_nominal_predictors(), threshold = 0.01) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_nzv(all_predictors()) %>%
+  step_corr(all_numeric_predictors(), threshold = 0.95) %>%
+  step_lincomb(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+```
+
+## Step 4 – Diagnostics (exploration only, not used for modelling)
+
+```{r diagnostics}
+prepped_recipe  <- prep(model_recipe, training = train_data)
+processed_train <- bake(prepped_recipe, new_data = NULL)
+
+n_predictors <- ncol(processed_train) - 1
+n_predictors                                  # predictors after preprocessing
+
+anyNA(processed_train)                        
+tidy(prepped_recipe)                          
+
+# which columns step_corr removed
+corr_id <- tidy(prepped_recipe) %>% filter(type == "corr") %>% pull(number)
+tidy(prepped_recipe, number = corr_id)
+```
+
+## Step 5 – Cross-validation folds and metrics
+
+```{r folds}
+set.seed(381)
+folds <- vfold_cv(train_data, v = 5, strata = FoodInsecure_flag)
+
+cv_metrics <- metric_set(accuracy, precision, recall, f_meas, roc_auc)
+ctrl_res   <- control_resamples(save_pred = TRUE)
+ctrl_grid  <- control_grid(save_pred = TRUE)
+```
+
+## Step 6 – Model specifications
+
+```{r models}
+logistic_model <- logistic_reg() %>%
+  set_engine("glm") %>%
+  set_mode("classification")
+
+rf_model <- rand_forest(trees = 500, mtry = tune(), min_n = tune()) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+```
+
+## Step 7 – Workflows
+
+```{r workflows}
+logistic_workflow <- workflow() %>%
+  add_recipe(model_recipe) %>%
+  add_model(logistic_model)
+
+rf_workflow <- workflow() %>%
+  add_recipe(model_recipe) %>%
+  add_model(rf_model)
+```
+
+## Step 8 – Random forest tuning grid
+
+`mtry` is bounded by the real number of predictors from Step 4.
+
+```{r grid}
+rf_params <- extract_parameter_set_dials(rf_workflow) %>%
+  update(
+    mtry  = mtry(range = c(2, max(3, floor(n_predictors / 2)))),
+    min_n = min_n(range = c(2, 20))
+  )
+
+rf_grid <- grid_regular(rf_params, levels = 5)   # 25 combinations
+rf_grid
+```
+
+## Step 9- logistic regression and tune random forest
+
+Same folds for both models, so the comparison is fair. 
+
+```{r fit-cv}
+logistic_results <- readRDS("data/logistic_results.rds")
+rf_tuned         <- readRDS("data/rf_tuned.rds")
+```
+
+## Step 10 – Compare models using cross-validation
+
+```{r compare}
+collect_metrics(logistic_results)
+
+show_best(rf_tuned, metric = "roc_auc", n = 5)
+autoplot(rf_tuned)
+
+best_rf <- select_best(rf_tuned, metric = "roc_auc")
+best_rf
+
+comparison <- bind_rows(
+  collect_metrics(logistic_results) %>%
+    mutate(model = "Logistic regression"),
+  collect_metrics(rf_tuned) %>%
+    inner_join(best_rf, by = c("mtry", "min_n")) %>%
+    mutate(model = "Random forest (tuned)")
+) %>%
+  select(model, .metric, mean, std_err)
+
+comparison
+```
+
+## Step 11 – Final fit on full training set, evaluate once on the test set
+```{r fit-final}
+final_rf <- finalize_workflow(rf_workflow, best_rf) %>% fit(train_data)
+final_lr <- fit(logistic_workflow, train_data)
+
+eval_model <- function(fit, data, name) {
+  preds <- augment(fit, data)
+  list(
+    metrics = cv_metrics(preds, truth = FoodInsecure_flag,
+                         estimate = .pred_class, .pred_Insecure) %>%
+      mutate(model = name),
+    cm  = conf_mat(preds, truth = FoodInsecure_flag, estimate = .pred_class),
+    roc = roc_curve(preds, truth = FoodInsecure_flag, .pred_Insecure) %>%
+      mutate(model = name)
+  )
+}
+
+lr_test <- eval_model(final_lr, test_data, "Logistic regression")
+rf_test <- eval_model(final_rf, test_data, "Random forest")
+
+bind_rows(lr_test$metrics, rf_test$metrics) %>%
+  select(model, .metric, .estimate) %>%
+  pivot_wider(names_from = .metric, values_from = .estimate)
+
+lr_test$cm
+rf_test$cm
+```
+
+## Step 12 – ROC curves and interpretation
+
+```{r roc-importance}
+bind_rows(lr_test$roc, rf_test$roc) %>%
+  ggplot(aes(1 - specificity, sensitivity, colour = model)) +
+  geom_path(linewidth = 1) +
+  geom_abline(linetype = "dashed") +
+  coord_equal() +
+  theme_minimal() +
+  labs(title = "ROC curves on held-out test data")
+
+# Random forest variable importance (no vip package needed)
+rf_imp <- final_rf %>%
+  extract_fit_engine() %>%
+  ranger::importance() %>%
+  enframe(name = "variable", value = "importance") %>%
+  arrange(desc(importance)) %>%
+  slice_head(n = 15)
+
+rf_imp
+
+ggplot(rf_imp, aes(importance, reorder(variable, importance))) +
+  geom_col(fill = "steelblue") +
+  theme_minimal() +
+  labs(x = "Importance (impurity)", y = NULL,
+       title = "Top 15 variables - random forest")
+
+# Logistic regression: significant coefficients as odds ratios
+final_lr %>%
+  tidy(exponentiate = TRUE) %>%
+  filter(term != "(Intercept)", p.value < 0.05) %>%
+  arrange(p.value) %>%
+  slice_head(n = 15)
+```

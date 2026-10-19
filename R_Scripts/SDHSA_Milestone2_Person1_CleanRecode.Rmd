@@ -1,0 +1,540 @@
+---
+title: "SDHSA Milestone 2 — Task 1 & Task 2 (Person 1)"
+subtitle: "Confirm Data Selection, Clean and Recode for D01, D04, D05, D07, D09"
+author: "Person 1"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(stringr)
+library(knitr)
+```
+
+# Task 1 — Confirm Data Selection
+
+## 1.1 Reconfirmed dataset selection
+
+Milestone 1 selected D01_Population_Profile, D04_Dwelling_Conditions,
+D05_Basic_Services, D07_Household_Wellbeing, D09_Household_Resources to explain
+household food security/well-being via demographic composition, housing/service
+access, and resources. This selection is reconfirmed for Milestone 2: Milestone
+1's full 11-dataset inspection did not surface a reason to add or drop a dataset
+from this set, it did confirm that D11 is structurally incompatible with all
+others (zero shared HouseholdIDs) and would have been excluded even if considered.
+
+## 1.2 Target analytical grain
+
+The final analytical dataset will be at household level(one row per
+`HouseholdID`). D04, D05, D07, D09 are already at this grain. D01 is person-level
+and must be aggregated to household level (e.g. household size, dependants,
+population-group composition) before it can be joined, this aggregation is a
+Task 3 integration step (Person 2's role); Person 1's job here is to clean D01 at
+its native person grain and hand off a tidy person-level file plus a note on the
+aggregation needed.
+
+**Note for Person 2 (Task 3):** D01 contains 25 rows with a missing `HouseholdID`
+(see §2.1). These rows cannot be assigned to any household and are excluded from
+the person-level file handed off here — they are preserved separately in
+`D01_excluded_missing_householdid.csv` for audit, but should **not** be included
+in any household-level aggregation.
+
+## 1.3 Attribute weighting approach
+
+Not every retained column carries equal analytical weight for the business problem
+(explaining food security/well-being). Rather than assign arbitrary numeric weights
+before any model exists (premature and unjustifiable at this stage), attributes are
+tiered qualitatively, to guide which variables Task 4 (Person 3) should prioritise
+as predictors versus context:
+
+| Tier | Meaning | Examples |
+|---|---|---|
+| **High** | Directly measures resources/access hypothesised to drive the outcome | `MainIncomeSourceCode`, `SocialGrantRecipients` (D09); `DrinkingWaterSourceCode`, `MainToiletCode` (D05); the food-security item codes themselves (D07) |
+| **Medium** | Demographic/context variables that condition or moderate the outcome | `Age`, `PopulationGroupCode` (D01); `MainDwellingCode`, `TenureCode` (D04) |
+| **Low** | Administrative/design fields — needed for correct estimation but not substantive predictors | `SurveyYear`, `GeoTypeCode`, `*Weight` (survey design weights) |
+
+**How this will be applied:** High-tier variables are the primary candidates for
+Milestone 3 modelling/segmentation; Medium-tier variables are kept as
+demographic-segmentation/control variables; Low-tier variables are retained for
+correct survey-weighted estimation (see rubric note on weights below) but are
+never used as predictors.
+
+## 1.4 Relevant subset selection
+
+Column-level selection is applied per dataset in Task 2 below (dropping columns
+that are pure skip-logic artefacts with no analytical content once decoded).
+Row-level selection (removing orphan/duplicate records) is also handled in Task 2,
+with before/after row counts as verification.
+
+---
+
+# Task 2 — Clean and Recode
+
+```{r import}
+path <-"../data/"
+read_fixed <- function(f) read_csv(paste0(path,f), show_col_types = FALSE,
+                        col_types = cols(HouseholdID = col_character(), .default = col_guess()))
+d01 <- read_fixed("D01_Population_Profile.csv")
+d04 <- read_fixed("D04_Dwelling_Conditions.csv")
+d05 <- read_fixed("D05_Basic_Services.csv")
+d07 <- read_fixed("D07_Household_wellbeing.csv")
+d09 <- read_fixed("D09_Household_Resources.csv")
+
+province_lookup <- tibble(
+  ProvinceCode = 1:9,
+  ProvinceClean = c("Western Cape","Eastern Cape","Northern Cape","Free State",
+                     "KwaZulu-Natal","North West","Gauteng","Mpumalanga","Limpopo")
+)
+```
+
+*(Verified against the raw data: every `ProvinceCode` in every file falls in
+1–9 with no missing codes, and the modal `Province` text for each code matches
+the mapping above exactly — so the lookup join below cannot silently introduce
+an `NA` province.)*
+
+## 2.0 Province casing (applies to all five datasets)
+
+**Problem:** `Province` (text) is inconsistently cased (up to 24 distinct values
+where 9 are expected), but `ProvinceCode` (1–9 numeric) is confirmed clean and
+consistent across every file.
+
+**Treatment:** Derive a single canonical `ProvinceClean` label from `ProvinceCode`
+via a lookup table; retain the original `Province` text as `Province_source` for
+traceability rather than deleting it.
+
+```{r province-fix}
+fix_province <- function(df) {
+  df %>%
+    rename(Province_source = Province) %>%
+    left_join(province_lookup, by = "ProvinceCode")
+}
+d01 <- fix_province(d01); d04 <- fix_province(d04); d05 <- fix_province(d05)
+d07 <- fix_province(d07); d09 <- fix_province(d09)
+```
+
+**Effect / Verification:**
+
+```{r province-verify}
+n_distinct(d01$ProvinceClean); n_distinct(d04$ProvinceClean)
+n_distinct(d05$ProvinceClean); n_distinct(d07$ProvinceClean); n_distinct(d09$ProvinceClean)
+table(d01$ProvinceClean)
+```
+
+All five files now resolve to exactly 9 clean province categories, verified by count.
+
+## 2.1 D01 — Population Profile
+
+**Problem 0 — Missing `HouseholdID`:** 25 rows have no `HouseholdID` at all.
+These rows cannot be linked to any household and, left in place, distort every
+downstream key check (see Problem 2 below, which is a direct consequence of this).
+
+**Treatment:** Exclude these rows from the working file and preserve them
+separately for audit — dropped silently is not acceptable, dropped-and-logged is.
+
+```{r d01-missing-id}
+missing_id <- is.na(d01$HouseholdID) | d01$HouseholdID == ""
+cat("Rows with missing HouseholdID:", sum(missing_id), "\n")
+
+d01_excluded <- d01 %>% filter(missing_id)
+write_csv(d01_excluded, "D01_excluded_missing_householdid.csv")
+
+d01 <- d01 %>% filter(!missing_id)
+nrow(d01)
+```
+
+**Problem 1 — Invalid ages:** 9 negative ages (down to −7) and 9 ages above 120
+(up to 175) found in Milestone 1.
+
+**Treatment:** Recode biologically impossible ages (`Age < 0` or `Age > 110`) to
+`NA` rather than guessing a true value or deleting the row (the rest of the row's
+data may still be usable).
+
+```{r d01-age}
+before_invalid <- sum(d01$Age < 0 | d01$Age > 110, na.rm = TRUE)
+d01 <- d01 %>% mutate(Age_clean = if_else(Age < 0 | Age > 110, NA_real_, Age))
+after_invalid <- sum(d01$Age_clean < 0 | d01$Age_clean > 110, na.rm = TRUE)
+cat("Invalid ages before:", before_invalid, "| after recode:", after_invalid, "\n")
+summary(d01$Age_clean)
+```
+
+**Problem 2 — Duplicate person-keys:** revisited after fixing Problem 0.
+
+With the 25 missing-`HouseholdID` rows still in the file, a naive
+`count(HouseholdID, PersonNumber)` reports several "duplicate" keys — but every
+one of those groups turns out to share a **missing** `HouseholdID`, not a real
+one (`dplyr::count()` buckets all `NA`s together, so different households that
+happen to share a `PersonNumber` collapse into one apparent group the moment
+their ID is blank). That was investigated and confirmed to be an artefact of
+Problem 0, not a genuine data-quality issue in its own right. Having removed the
+missing-ID rows above, the check is re-run on the remaining, ID-complete data:
+
+```{r d01-dupkeys}
+dup_keys <- d01 %>% count(HouseholdID, PersonNumber) %>% filter(n > 1)
+nrow(dup_keys)
+
+d01 <- d01 %>%
+  mutate(person_key = paste(HouseholdID, PersonNumber)) %>%
+  mutate(flag_duplicate_key = person_key %in% paste(dup_keys$HouseholdID, dup_keys$PersonNumber))
+sum(d01$flag_duplicate_key)
+```
+
+**Verification:** `r nrow(dup_keys)` genuine duplicate keys remain among rows
+with a real `HouseholdID` — `r sum(d01$flag_duplicate_key)` rows flagged. If this
+is 0 (as expected once Problem 0 is fixed), D01 has no real person-level
+duplication and `HouseholdID + PersonNumber` is a clean primary key; the flag
+column is kept regardless so Task 3 has a documented check to rely on rather than
+re-deriving it.
+
+## 2.2 D04 — Dwelling Conditions
+
+**Problem 1 — Exact duplicate rows:** 16 fully duplicate rows found in Milestone 1.
+
+**Treatment:** Remove with `distinct()` — these are genuine copy duplicates, not
+legitimate repeated identifiers (verified in M1 by comparing full row content).
+
+```{r d04-dup}
+before_n <- nrow(d04)
+d04 <- d04 %>% distinct()
+after_n <- nrow(d04)
+cat("D04 rows before:", before_n, "| after de-duplication:", after_n,
+    "| removed:", before_n - after_n, "\n")
+n_distinct(d04$HouseholdID) == nrow(d04)
+```
+
+**Verification:** row count now equals unique `HouseholdID` count — TRUE confirms
+one row per household.
+
+**Problem 2 — `RentRaw` sentinel:** value `88` dominates (75.2%), meaning
+"not applicable" (household does not rent), not a real rent amount of 88.
+
+**Treatment:** Recode `88` to `NA` in a new `RentRaw_clean` column; keep the
+original for traceability.
+
+```{r d04-rent}
+d04 <- d04 %>% mutate(RentRaw_clean = if_else(RentRaw == 88, NA_real_, RentRaw))
+sum(d04$RentRaw == 88, na.rm = TRUE)
+sum(is.na(d04$RentRaw_clean))
+summary(d04$RentRaw_clean)
+```
+
+**Verification:** all 88s converted to NA; remaining values are plausible rent
+figures.
+
+**Problem 3 — `WallMaterialCode`:** 55 genuine `NA`s (not a sentinel issue, real
+missing), plus a separate single value of `99` that sits far outside the
+documented 1–12 category range and is itself a sentinel, not a wall material.
+
+**Treatment:** Genuine `NA`s are left as `NA` — imputing a construction-material
+code with no domain basis would fabricate data; documented as low-volume
+missingness (`r round(55/nrow(d04)*100,2)`% of rows) acceptable to carry forward
+as-is. The `99` sentinel is recoded to `NA` separately in `WallMaterialCode_clean`.
+
+```{r d04-wallmaterial}
+sum(is.na(d04$WallMaterialCode))
+sum(d04$WallMaterialCode == 99, na.rm = TRUE)
+d04 <- d04 %>% mutate(WallMaterialCode_clean = if_else(WallMaterialCode == 99, NA_real_, WallMaterialCode))
+```
+
+**Problem 4 — `HouseholdSize == 0`:** 12 households recorded with zero members,
+which is not a valid household size by definition.
+
+**Treatment:** Recode to `NA` in `HouseholdSize_clean` rather than deleting the
+row — the rest of the dwelling record (materials, tenure, rooms) is still usable,
+only the size figure itself is untrustworthy.
+
+```{r d04-size}
+sum(d04$HouseholdSize == 0, na.rm = TRUE)
+d04 <- d04 %>% mutate(HouseholdSize_clean = if_else(HouseholdSize == 0, NA_real_, HouseholdSize))
+```
+
+**Problem 5 — `TotalRooms` sentinel:** the raw maximum is 99 rooms (5 rows),
+a clear outlier against the next-highest genuine value (25) and consistent with
+the survey's 2-digit "not applicable/unspecified" sentinel pattern used
+elsewhere in this file (e.g. `RentRaw == 88`).
+
+**Treatment:** Recode `99` to `NA` in `TotalRooms_clean`; values up to 25 are
+kept as plausible (large households can have many rooms).
+
+```{r d04-rooms}
+sum(d04$TotalRooms == 99, na.rm = TRUE)
+d04 <- d04 %>% mutate(TotalRooms_clean = if_else(TotalRooms == 99, NA_real_, TotalRooms))
+summary(d04$TotalRooms_clean)
+```
+
+## 2.3 D05 — Basic Services
+
+**Problem 1 — 15 orphan `UNMATCHED_xxxxx` household IDs**, confirmed in Milestone
+1 to exist in no other dataset.
+
+**Treatment:** Remove these rows — they cannot be joined to any other selected
+dataset and would only ever appear as unmatched records in Task 3, adding noise
+with zero analytical value for a household-level integrated dataset.
+
+```{r d05-orphans}
+before_n <- nrow(d05)
+d05 <- d05 %>% filter(!str_starts(HouseholdID, "UNMATCHED"))
+after_n <- nrow(d05)
+cat("D05 rows before:", before_n, "| after removing orphans:", after_n,
+    "| removed:", before_n - after_n, "\n")
+```
+
+**Problem 2 — Sentinel codes** in `DistanceToWaterCode`, `PipedWaterCode`,
+`WaterInterruptionFrequencyCode`, `WaterAlternativeSourceCode`, `ToiletDistanceCode`
+(all dominated by `8`/`88`).
+
+**Treatment:** Recode `8`/`88` to `NA` for each, creating `_clean` columns.
+
+```{r d05-sentinels}
+d05 <- d05 %>%
+  mutate(
+    DistanceToWaterCode_clean = if_else(DistanceToWaterCode == 8, NA_real_, DistanceToWaterCode),
+    PipedWaterCode_clean = if_else(PipedWaterCode == 8, NA_real_, PipedWaterCode),
+    WaterInterruptionFrequencyCode_clean = if_else(WaterInterruptionFrequencyCode == 8, NA_real_, WaterInterruptionFrequencyCode),
+    WaterAlternativeSourceCode_clean = if_else(WaterAlternativeSourceCode == 88, NA_real_, WaterAlternativeSourceCode),
+    ToiletDistanceCode_clean = if_else(ToiletDistanceCode == 8, NA_real_, ToiletDistanceCode)
+  )
+sapply(d05 %>% select(ends_with("_clean")), function(x) sum(is.na(x)))
+```
+
+**Verification:** NA counts above match the pre-recode sentinel counts identified
+in Milestone 1 (e.g. `ToiletDistanceCode` ~96.7% now NA, consistent with the
+original finding).
+
+**Problem 3 — `DrinkingWaterSourceCode` missingness:** 60 genuine NAs.
+
+**Treatment:** Left as NA (same reasoning as D04's `WallMaterialCode`) — genuine,
+low-volume (`r round(60/nrow(d05)*100,2)`%), no safe imputation basis.
+
+## 2.4 D07 — Household Wellbeing (outcome dataset)
+
+**Problem 1 — 15 exact duplicate rows.**
+
+**Treatment:** Remove with `distinct()`.
+
+```{r d07-dup}
+before_n <- nrow(d07)
+d07 <- d07 %>% distinct()
+after_n <- nrow(d07)
+cat("D07 rows before:", before_n, "| after de-duplication:", after_n,
+    "| removed:", before_n - after_n, "\n")
+```
+
+**Problem 2 — Food-security item sentinels:** `FewFoodsDays`, `SkippedMealDays`,
+`AteLessDays`, `RanOutDays` all dominated by `8` ("not applicable" — household
+did not experience that item, so no day-count applies).
+
+**Treatment:** Recode `8` to `NA` (distinct from a true `0` days, which would mean
+"applicable but zero days" — conflating the two would bias any food-insecurity
+severity score).
+
+```{r d07-food-sentinels}
+d07 <- d07 %>%
+  mutate(
+    FewFoodsDays_clean = if_else(FewFoodsDays == 8, NA_real_, FewFoodsDays),
+    SkippedMealDays_clean = if_else(SkippedMealDays == 8, NA_real_, SkippedMealDays),
+    AteLessDays_clean = if_else(AteLessDays == 8, NA_real_, AteLessDays),
+    RanOutDays_clean = if_else(RanOutDays == 8, NA_real_, RanOutDays)
+  )
+sapply(d07 %>% select(ends_with("Days_clean")), function(x) sum(is.na(x)))
+```
+
+**Problem 3 — `HouseholdSize == 0`:** 10 households recorded with zero members
+in this file (a separate, independently-captured copy of `HouseholdSize` from D04).
+
+**Treatment:** Same treatment as D04 — recode to `NA` in `HouseholdSize_clean`,
+row otherwise retained.
+
+```{r d07-size}
+sum(d07$HouseholdSize == 0, na.rm = TRUE)
+d07 <- d07 %>% mutate(HouseholdSize_clean = if_else(HouseholdSize == 0, NA_real_, HouseholdSize))
+```
+
+**Problem 4 — `TotalMonthlyHouseholdIncomeRaw` sentinel family + extreme outlier:**
+`9999999` (seven 9s) is used as "refused/missing" (2.1% of rows). Investigating
+the remaining distribution (rather than assuming it is now clean) surfaces a
+further set of values that are literal runs of 8, 9, and 10 nines
+(`99999999`, `999999999`, `9999999999`) — the same placeholder convention at a
+different length, not real incomes of R100 million–R10 billion. These would
+otherwise be missed by a rule that only matches `== 9999999` exactly.
+
+**Treatment:** Recode any value that is a run of 6 or more repeated `9`s to `NA`
+— a general rule that catches the whole sentinel family rather than one specific
+length of it. Values below that pattern are left untouched and are treated as
+plausible (a national household survey can genuinely include a few high-income
+households; the distinguishing feature here is the digit pattern, not just
+the magnitude).
+
+```{r d07-income}
+is_repdigit_sentinel <- function(x, digit = "9", min_len = 6) {
+  s <- as.character(as.integer(x))
+  !is.na(x) & nchar(s) >= min_len & sapply(strsplit(s, ""), function(ch) all(ch == digit))
+}
+
+sentinel_income <- is_repdigit_sentinel(d07$TotalMonthlyHouseholdIncomeRaw)
+sum(sentinel_income)
+
+d07 <- d07 %>% mutate(Income_clean = if_else(sentinel_income, NA_real_, TotalMonthlyHouseholdIncomeRaw))
+summary(d07$Income_clean)
+sum(d07$Income_clean > 500000, na.rm = TRUE)
+d07 %>% filter(Income_clean > 500000) %>% select(HouseholdID, Income_clean) %>% head(10)
+```
+
+**Verification / decision:** after removing the repdigit-9 sentinel family, the
+remaining values above R500,000/month are re-examined. Any that remain are
+genuinely-shaped numbers (not repeating digits) and are flagged rather than
+deleted, since a few wealthy households are plausible in a national survey and
+deletion would need a stronger reason than "it's a big number" — but a repeating
+run of 9s is that stronger reason, which is why those specific values (and only
+those) were nulled above.
+
+**Problem 5 — `RanOutOfFoodCode` recoding:** raw codes are `1`/`2`/`9`.
+
+**Treatment:** Recode into an analytically meaningful factor while preserving the
+source code, following typical Stats SA convention (1 = Yes, 2 = No) with `9`
+kept as its own explicit "Don't know/refused" category rather than merged into
+either Yes or No — **this label mapping is provisional** pending confirmation
+against the official GHS codebook (none was supplied with the data pack), and is
+flagged as such.
+
+```{r d07-recode}
+d07 <- d07 %>%
+  mutate(RanOutOfFood_label = case_when(
+    RanOutOfFoodCode == 1 ~ "Yes",
+    RanOutOfFoodCode == 2 ~ "No",
+    RanOutOfFoodCode == 9 ~ "Don't know/refused",
+    TRUE ~ NA_character_
+  ))
+table(d07$RanOutOfFood_label, useNA = "ifany")
+```
+
+## 2.5 D09 — Household Resources
+
+**Problem 1 — 15 exact duplicate rows.**
+
+```{r d09-dup}
+before_n <- nrow(d09)
+d09 <- d09 %>% distinct()
+after_n <- nrow(d09)
+cat("D09 rows before:", before_n, "| after de-duplication:", after_n,
+    "| removed:", before_n - after_n, "\n")
+```
+
+**Problem 2 — `MainIncomeSourceCode`:** 65 genuine `NA`s, plus a separate `99`
+sentinel (4 rows) outside the documented 1–8 category range.
+
+**Treatment:** Genuine `NA`s left as-is (no fabricated imputation). The `99`
+sentinel is recoded to `NA` separately in `MainIncomeSourceCode_clean`.
+
+```{r d09-mainincome}
+sum(is.na(d09$MainIncomeSourceCode))
+sum(d09$MainIncomeSourceCode == 99, na.rm = TRUE)
+d09 <- d09 %>% mutate(MainIncomeSourceCode_clean = if_else(MainIncomeSourceCode == 99, NA_real_, MainIncomeSourceCode))
+```
+
+**Problem 3 — `TotalVehicles` mixed encoding:** this column is read as
+character because it mixes genuine vehicle counts (`1`–`7`) with the sentinel
+`88`, the sentinel `99`, and the literal text `"Unknown"` — three different
+encodings of "not a real count" in one field, which also blocks any numeric
+summary until fixed.
+
+**Treatment:** `88` is verified (via cross-tab against `VehicleAssetCode`) to
+mean "no vehicle" rather than missing — households with `VehicleAssetCode == 2`
+(no vehicle) show `TotalVehicles == 88` in the overwhelming majority of cases —
+so `88` is recoded to `0`. `99` and `"Unknown"` have no such basis and are
+recoded to `NA`. The result is a genuine numeric column.
+
+```{r d09-vehicles}
+table(d09$VehicleAssetCode, d09$TotalVehicles == "88")
+
+tv_num <- suppressWarnings(as.numeric(d09$TotalVehicles))
+sum(d09$TotalVehicles == "Unknown", na.rm = TRUE)
+sum(tv_num == 99, na.rm = TRUE)
+sum(tv_num == 88, na.rm = TRUE)
+
+tv_num[tv_num == 88] <- 0
+tv_num[tv_num == 99] <- NA
+d09$TotalVehicles_clean <- tv_num
+summary(d09$TotalVehicles_clean)
+```
+
+**Problem 4 — `TotalMonthlyHouseholdIncomeRaw`:** this file carries its own copy
+of the same income field used in D07, with the same repdigit-9 sentinel family.
+
+**Treatment:** Apply the identical rule used in D07 (§2.4, Problem 4) so the two
+files are cleaned consistently rather than diverging.
+
+```{r d09-income}
+sentinel_income9 <- is_repdigit_sentinel(d09$TotalMonthlyHouseholdIncomeRaw)
+sum(sentinel_income9)
+d09 <- d09 %>% mutate(Income_clean = if_else(sentinel_income9, NA_real_, TotalMonthlyHouseholdIncomeRaw))
+summary(d09$Income_clean)
+```
+
+## 2.6 Cross-file consistency checks (diagnostic only)
+
+D04, D07 and D09 each carry their own copy of `HouseholdSize`, and D07/D09 each
+carry their own copy of `TotalMonthlyHouseholdIncomeRaw`. These are compared here
+purely to document where they disagree — **this is a verification join, not an
+analytical merge**; no value is overwritten based on it, since there is no
+codebook basis in this data pack for deciding which file's figure is "correct."
+Person 3 (Task 4) should treat any household appearing below as needing a
+judgement call, not an automatic fix.
+
+```{r cross-file-checks}
+hh_size <- d04 %>%
+  select(HouseholdID, HouseholdSize_D04 = HouseholdSize) %>%
+  inner_join(d07 %>% select(HouseholdID, HouseholdSize_D07 = HouseholdSize), by = "HouseholdID") %>%
+  inner_join(d09 %>% select(HouseholdID, HouseholdSize_D09 = HouseholdSize), by = "HouseholdID") %>%
+  filter(HouseholdSize_D04 != HouseholdSize_D07 | HouseholdSize_D04 != HouseholdSize_D09)
+nrow(hh_size)
+write_csv(hh_size, "flag_householdsize_mismatches.csv")
+
+income_check <- d07 %>%
+  select(HouseholdID, Income_D07 = TotalMonthlyHouseholdIncomeRaw) %>%
+  inner_join(d09 %>% select(HouseholdID, Income_D09 = TotalMonthlyHouseholdIncomeRaw), by = "HouseholdID") %>%
+  filter(Income_D07 != Income_D09)
+nrow(income_check)
+write_csv(income_check, "flag_income_mismatches.csv")
+```
+
+**Finding:** `r nrow(hh_size)` households have a `HouseholdSize` that disagrees
+across at least two of D04/D07/D09, and `r nrow(income_check)` households have a
+`TotalMonthlyHouseholdIncomeRaw` that disagrees between D07 and D09. Both sets
+are exported for Task 3/4 to review rather than silently resolved here.
+
+## 2.7 Post-cleaning verification summary
+
+```{r summary-table}
+summary_tbl <- tibble(
+  dataset = c("D01","D04","D05","D07","D09"),
+  rows_final = c(nrow(d01), nrow(d04), nrow(d05), nrow(d07), nrow(d09)),
+  unique_HouseholdID = c(n_distinct(d01$HouseholdID), n_distinct(d04$HouseholdID),
+                          n_distinct(d05$HouseholdID), n_distinct(d07$HouseholdID),
+                          n_distinct(d09$HouseholdID)),
+  province_categories = c(n_distinct(d01$ProvinceClean), n_distinct(d04$ProvinceClean),
+                           n_distinct(d05$ProvinceClean), n_distinct(d07$ProvinceClean),
+                           n_distinct(d09$ProvinceClean))
+)
+kable(summary_tbl, caption = "Post-cleaning row counts, key uniqueness and province categories")
+```
+
+D04, D07 and D09 should show identical `unique_HouseholdID` counts (they
+describe the same household population); D05 should be a subset of that count;
+D01's `unique_HouseholdID` will be lower than its `rows_final` because it is
+person-level, and now excludes the 25 rows with no ID at all (§2.1).
+
+```{r export, include=FALSE}
+write_csv(d01, "D01_cleaned.csv")
+write_csv(d04, "D04_cleaned.csv")
+write_csv(d05, "D05_cleaned.csv")
+write_csv(d07, "D07_cleaned.csv")
+write_csv(d09, "D09_cleaned.csv")
+```

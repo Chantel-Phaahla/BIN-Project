@@ -1,0 +1,232 @@
+---
+title: "Task 4"
+output: word_document
+date: "2026-09-18"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(caret)
+```
+
+```{r}
+data <- read_csv("data/household_data_integrated.csv")
+dictionary <- read_csv("data/data_dictionary.csv")
+```
+```{r}
+nrow(data); ncol(data)
+```
+```{r}
+#Problem : Task 3's integration must have produced excatly one row per household. Verifying this will help protect every downstream step.
+```
+
+```{r}
+#Make sure there is only one row for each household before analysing the data.
+nrow(data)
+n_distinct(data$HouseholdID)
+dup_ids <- data %>%
+  count(HouseholdID) %>%
+  filter(n > 1)
+
+dup_ids
+data %>%
+  filter(HouseholdID %in% dup_ids$HouseholdID) %>%
+  arrange(HouseholdID)
+data <- data %>% distinct()
+data <- data %>%
+  group_by(HouseholdID) %>%
+  slice(1) %>%   # or slice_max(some_date_column), or another rule
+  ungroup()
+n_distinct(data$HouseholdID) == nrow(data)
+```
+
+```{r}
+n_distinct(data$HouseholdID) == nrow(data)
+```
+```{r}
+# Problem : Task 3 's integration must have produced excatly one row per household. Verifying this now protects every downstream step.
+```
+
+```{r}
+sum(is.na(data))
+```
+```{r}
+colSums(is.na(data)) %>% sort(decreasing = TRUE) %>% head(10)
+```
+```{r}
+## STEP 1: DEFINE THE MODELLING TARGET
+data <- data %>% mutate(FoodInsecure_flag = factor(FoodInsecure_flag, levels = c(0,1)))
+
+table(data$FoodInsecure_flag)
+prop.table(table(data$FoodInsecure_flag))
+#Target: FoodInsecure_flag — 1 means the household ran out of food, and 0 means it did not.
+```
+```{r}
+#Milestone 3 's predictive goal needs a binary modelling target. 
+#Treatment : Used FoodInsecure_flag that was alreadu engineered in Task 3 from RanOutOfFoodCode (via RanOutOfFood_label, recoded in Task 2).
+```
+
+```{r}
+#==============================================================
+#Step 2 : Asssesing class imbalance 
+#==============================================================
+
+imbalance_ratio <- table(data$FoodInsecure_flag)[1] / table(data$FoodInsecure_flag)[2]
+as.numeric(imbalance_ratio)
+```
+```{r}
+#Problem : is the target skewed enough to need resampling? 
+#Treatment : check the majority and minority before ratio scaling 
+#Verification:ratio ≈ 4.46:1 - moderate, not severe (not 99:1), so addressed through stratified train/ test split in step 7 reather than resampling for example SMOTE 
+```
+
+```{r}
+# STEP 3: REMOVE IDENTIFIERS 
+
+exclude_tier_vars <- dictionary %>%
+  filter(Tier %in% c("Key", "Low")) %>%
+  pull(Variable)
+exclude_tier_vars
+
+```
+```{r}
+# Problem identifies and redundant / low-value columns (per the team data dictionary's Tier column) would be meaningless or even misleading as model predictor 
+#Treatment : drop every variable that is tagged "Key" or "Low" tier.
+```
+
+```{r}
+model_data <- data %>% select(-any_of(exclude_tier_vars))
+
+ncol(model_data)
+```
+```{r}
+# STEP 4: REMOVE LEAKAGE VARIABLES
+leakage_vars <- c(
+  "RanOutOfFoodCode", "RanOutOfFood_label", "RanOutDays", "RanOutDays_clean",
+  "HungryButDidNotEatCode", "WholeDayWithoutEatingCode",
+  "SkippedMealCode", "SkippedMealDays", "SkippedMealDays_clean",
+  "AteLessCode", "AteLessDays", "AteLessDays_clean",
+  "WorriedFoodWouldRunOutCode", "UnableToEatHealthyFoodCode",
+  "AteFewFoodsCode", "FewFoodsDays", "FewFoodsDays_clean",
+  "AdultHungerCode", "ChildHungerCode")
+```
+
+
+```{r}
+
+intersect(leakage_vars, names(model_data))
+model_data <- model_data %>% select(-any_of(leakage_vars))
+ncol(model_data)
+```
+```{r}
+#Probelm : FoodInsecure_flag is built directly from RanOutOfFoodCode. any variable that is from the same food-security question battery is too directly tied to the target and would leak the answer to the model.
+#Treatment: Removed all 18 related food-security variables 
+```
+
+```{r}
+# STEP 5: TRANSFORMATIONS / ENCODING (category levels before/after)
+code_vars <- model_data %>%
+  select(ends_with("Code")) %>%
+  names()
+```
+
+```{r}
+# Problem : the category codes are stored as integers , which would make R treat as continous numbers reather than categories . 
+#Treatment : convery every *Code column to a factor.
+```
+
+
+```{r}
+str(model_data[code_vars[1:3]])
+```
+
+```{r}
+sapply(model_data[code_vars[1:3]], function(x) length(unique(na.omit(x))))
+```
+```{r}
+model_data <- model_data %>%
+  mutate(across(all_of(code_vars), as.factor))
+```
+
+```{r}
+#Step 6 SCALING (technique-dependent)
+numeric_predictors <- model_data %>%
+  select(where(is.numeric)) %>%
+  select(-any_of(leakage_vars)) %>%
+  names()
+
+numeric_predictors
+```
+```{r}
+model_data_scaled <- model_data %>%
+  mutate(across(all_of(numeric_predictors), ~ as.numeric(scale(.))))
+```
+
+```{r}
+summary(model_data$Income_per_capita)     
+summary(model_data_scaled$Income_per_capita)
+```
+```{r}
+#Problem : K-means uses distance calculations so numeric predictors can vary in scales . thousands vs a 0-5 index) would let income dominate purely due to scale , not real importance. 
+#Treatment: standardized the z-score all numeric predictors 
+```
+
+```{r}
+# STEP 7: TRAIN/TEST SPLIT
+set.seed(381)
+
+split_index <- createDataPartition(model_data$FoodInsecure_flag, p = 0.8, list = FALSE)
+train_data <- model_data[split_index, ]
+test_data  <- model_data[-split_index, ]
+
+nrow(train_data); nrow(test_data)
+```
+```{r}
+prop.table(table(train_data$FoodInsecure_flag))
+prop.table(table(test_data$FoodInsecure_flag))
+```
+```{r}
+# Problem : needs to hold unseen data to evaluate Milestone 3 models, without the split accidentally breaking the target's class balance. 
+#Treatment: stratified 80/20 split , seed =381 for reproductibility.
+```
+
+```{r}
+# STEP 8: LEAKAGE PREVENTION CHECK
+#Confirm that no leakages variable survived into the final or test data 
+any(leakage_vars %in% names(train_data))
+
+length(intersect(split_index, setdiff(seq_len(nrow(model_data)), split_index)))
+```
+
+```{r verify_train_test_split}
+# Verification : the 0 overlap shows that train and test are fully disjoint.
+```
+
+```{r}
+# STEP 9: FINAL MISSINGNESS CHECK (after Task 4 changes)
+sum(is.na(model_data))
+```
+```{r}
+#Check which variables still have missing values in the modelling data so the group knows when interpreting the model results.For milestone 1 
+colSums(is.na(model_data)) %>% sort(decreasing = TRUE) %>% head(10)
+```
+```{r}
+# Problem : confirm wether removing leakage/tier variables changes 
+#overall missingness, and what remains for the group to be aware of
+```
+
+```{r cars}
+# ============================================================
+# SAVE FINAL MODELLING-READY DATASETS
+# ============================================================
+write_csv(train_data, "train_data.csv")
+write_csv(test_data, "test_data.csv")
+write_csv(model_data, "model_data_full.csv")
+write_csv(model_data_scaled, "model_data_scaled.csv")
+```
+
+
